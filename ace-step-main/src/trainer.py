@@ -25,6 +25,7 @@ from acestep.apg_guidance import apg_forward, MomentumBuffer
 from tqdm import tqdm
 import random
 import os
+from pathlib import Path
 from acestep.pipeline_ace_step import ACEStepPipeline
 
 
@@ -53,6 +54,8 @@ class Pipeline(LightningModule):
         dataset_path: str = "./data/your_dataset_path",
         lora_config_path: str = None,
         adapter_name: str = "lora_adapter",
+        mert_dir: str = None,          # 新增
+        mhubert_dir: str = None,       # 新增
     ):
         super().__init__()
 
@@ -95,52 +98,117 @@ class Pipeline(LightningModule):
         if self.is_train:
             self.transformers.train()
 
-            # download first
-            try:
-                self.mert_model = AutoModel.from_pretrained(
-                    "m-a-p/MERT-v1-330M", trust_remote_code=True, cache_dir=checkpoint_dir
-                ).eval()
-            except:
-                import json
-                import os
+            # --- MERT 本地/离线加载 ---
+            offline = os.environ.get("HF_HUB_OFFLINE", "0") == "1" or os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1"
+            mert_repo = "m-a-p/MERT-v1-330M"
 
-                mert_config_path = os.path.join(
-                    os.path.expanduser("~"),
-                    ".cache",
-                    "huggingface",
-                    "hub",
-                    "models--m-a-p--MERT-v1-330M",
-                    "blobs",
-                    "14f770758c7fe5c5e8ead4fe0f8e5fa727eb6942"
+            def _patch_mert_config_disable_bn(cfg_path):
+                try:
+                    with open(cfg_path, encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    if cfg.get("conv_pos_batch_norm", True):
+                        cfg["conv_pos_batch_norm"] = False
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            json.dump(cfg, f)
+                except Exception:
+                    pass
+
+            
+            if mert_dir and os.path.isdir(mert_dir):
+                cfg_path = os.path.join(mert_dir, "config.json")
+                _patch_mert_config_disable_bn(cfg_path)
+                self.mert_model = AutoModel.from_pretrained(
+                    mert_dir, trust_remote_code=True, local_files_only=True
+                ).eval()
+                self.processor_mert = Wav2Vec2FeatureExtractor.from_pretrained(
+                    mert_dir, trust_remote_code=True, local_files_only=True
+                )
+            else:
+                if offline:
+                    raise RuntimeError("离线环境下未提供 --mert_dir，本地 MERT 缺失：请下载到本地并用 --mert_dir 指定目录")
+                # 在线（有网）回退
+                try:
+                    self.mert_model = AutoModel.from_pretrained(
+                        mert_repo, trust_remote_code=True, cache_dir=checkpoint_dir, local_files_only=False
+                    ).eval()
+                except Exception:
+                    # 如遇 BN 问题，尝试修改缓存中的 config 后再试（可选）
+                    raise
+                self.processor_mert = Wav2Vec2FeatureExtractor.from_pretrained(
+                    mert_repo, trust_remote_code=True, local_files_only=False
                 )
 
-                with open(mert_config_path) as f:
-                    mert_config = json.load(f)
-                mert_config["conv_pos_batch_norm"] = False
-                with open(mert_config_path, mode="w") as f:
-                    json.dump(mert_config, f)
-                self.mert_model = AutoModel.from_pretrained(
-                    "m-a-p/MERT-v1-330M", trust_remote_code=True, cache_dir=checkpoint_dir
-                ).eval()
+            # # download first
+            # try:
+            #     self.mert_model = AutoModel.from_pretrained(
+            #         "m-a-p/MERT-v1-330M", trust_remote_code=True, cache_dir=checkpoint_dir
+            #     ).eval()
+            # except:
+            #     import json
+            #     import os
+
+            #     mert_config_path = os.path.join(
+            #         os.path.expanduser("~"),
+            #         ".cache",
+            #         "huggingface",
+            #         "hub",
+            #         "models--m-a-p--MERT-v1-330M",
+            #         "blobs",
+            #         "14f770758c7fe5c5e8ead4fe0f8e5fa727eb6942"
+            #     )
+
+            #     with open(mert_config_path) as f:
+            #         mert_config = json.load(f)
+            #     mert_config["conv_pos_batch_norm"] = False
+            #     with open(mert_config_path, mode="w") as f:
+            #         json.dump(mert_config, f)
+            #     self.mert_model = AutoModel.from_pretrained(
+            #         "m-a-p/MERT-v1-330M", trust_remote_code=True, cache_dir=checkpoint_dir
+            #     ).eval()
+            # self.mert_model.requires_grad_(False)
+            # self.resampler_mert = torchaudio.transforms.Resample(
+            #     orig_freq=48000, new_freq=24000
+            # )
+            # self.processor_mert = Wav2Vec2FeatureExtractor.from_pretrained(
+            #     "m-a-p/MERT-v1-330M", trust_remote_code=True
+            # )
+
+            # self.hubert_model = AutoModel.from_pretrained("utter-project/mHuBERT-147").eval()
+
             self.mert_model.requires_grad_(False)
-            self.resampler_mert = torchaudio.transforms.Resample(
-                orig_freq=48000, new_freq=24000
-            )
-            self.processor_mert = Wav2Vec2FeatureExtractor.from_pretrained(
-                "m-a-p/MERT-v1-330M", trust_remote_code=True
-            )
+            self.resampler_mert = torchaudio.transforms.Resample(orig_freq=48000, new_freq=24000)
 
-            self.hubert_model = AutoModel.from_pretrained("utter-project/mHuBERT-147").eval()
+            # --- mHuBERT 本地/离线加载（建议也本地化，避免后续同样报错） ---
+            mhubert_repo = "utter-project/mHuBERT-147"
+
+            print("Loading mHuBERT model...")
+            print("mHuBERT dir:", mhubert_dir, os.path.isdir(mhubert_dir))
+
+            if mhubert_dir and os.path.isdir(mhubert_dir):
+                self.hubert_model = AutoModel.from_pretrained(
+                    mhubert_dir, local_files_only=True
+                ).eval()
+                self.processor_mhubert = Wav2Vec2FeatureExtractor.from_pretrained(
+                    mhubert_dir, local_files_only=True
+                )
+            else:
+                if offline:
+                    raise RuntimeError("离线环境下未提供 --mhubert_dir，本地 mHuBERT 缺失：请下载到本地并用 --mhubert_dir 指定目录")
+                self.hubert_model = AutoModel.from_pretrained(mhubert_repo).eval()
+                self.processor_mhubert = Wav2Vec2FeatureExtractor.from_pretrained(
+                    mhubert_repo, cache_dir=checkpoint_dir
+                )
+
             self.hubert_model.requires_grad_(False)
-            self.resampler_mhubert = torchaudio.transforms.Resample(
-                orig_freq=48000, new_freq=16000
-            )
-            self.processor_mhubert = Wav2Vec2FeatureExtractor.from_pretrained(
-                "utter-project/mHuBERT-147",
-                cache_dir=checkpoint_dir,
-            )
-
+            self.resampler_mhubert = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)
             self.ssl_coeff = ssl_coeff
+
+            # self.hubert_model.requires_grad_(False)
+            # self.resampler_mhubert = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)
+            # self.ssl_coeff = ssl_coeff
+
+            # self.processor_mhubert = Wav2Vec2FeatureExtractor.from_pretrained("utter-project/mHuBERT-147", cache_dir=checkpoint_dir)
+            # self.ssl_coeff = ssl_coeff
 
     def infer_mert_ssl(self, target_wavs, wav_lengths):
         # Input is N x 2 x T (48kHz), convert to N x T (24kHz), mono
@@ -827,7 +895,9 @@ def main(args):
         dataset_path=args.dataset_path,
         checkpoint_dir=args.checkpoint_dir,
         adapter_name=args.exp_name,
-        lora_config_path=args.lora_config_path
+        lora_config_path=args.lora_config_path,
+        mert_dir=args.mert_dir,              # 新增传参
+        mhubert_dir=args.mhubert_dir,        # 新增传参
     )
     checkpoint_callback = ModelCheckpoint(
         monitor=None,
@@ -886,5 +956,7 @@ if __name__ == "__main__":
     args.add_argument("--every_plot_step", type=int, default=2000)
     args.add_argument("--val_check_interval", type=int, default=None)
     args.add_argument("--lora_config_path", type=str, default="config/zh_rap_lora_config.json")
+    args.add_argument("--mert_dir", type=str, default=None)       # 新增
+    args.add_argument("--mhubert_dir", type=str, default=None)    # 新增
     args = args.parse_args()
     main(args)
