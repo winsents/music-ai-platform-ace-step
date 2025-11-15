@@ -12,7 +12,8 @@ torch
 torchaudio
 torchvision
 tqdm
-transformers==4.50.0
+# Transformers >=4.52 provides `transformers.modeling_layers` required by PEFT
+transformers>=4.52.0,<5
 py3langid==0.3.0
 hangul-romanize==0.1.0
 num2words==0.5.14
@@ -21,6 +22,7 @@ accelerate==1.6.0
 cutlet
 fugashi[unidic-lite]
 click
-peft
+# PEFT version aligned with Transformers >=4.52
+peft>=0.16.0
 tensorboard
 tensorboardX
