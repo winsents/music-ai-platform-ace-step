@@ -4,6 +4,7 @@ miniprogram_npm
 /dist
 /*_local
 
+/data/processed/ace_data/
 /data/processed/raint/wav/
 /data/processed/audio_segments/
 /data/raw/

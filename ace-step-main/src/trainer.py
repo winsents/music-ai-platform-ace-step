@@ -554,7 +554,7 @@ class Pipeline(LightningModule):
         return timesteps
 
     def run_step(self, batch, batch_idx):
-        self.plot_step(batch, batch_idx)
+        # self.plot_step(batch, batch_idx)
         (
             keys,
             target_latents,
@@ -932,13 +932,20 @@ def main(args):
         ckpt_path=args.ckpt_path,
     )
 
+import multiprocessing as mp
 
 if __name__ == "__main__":
+    # 避免 fork 引发的 DataLoader/CUDA 死锁
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
     args = argparse.ArgumentParser()
     args.add_argument("--num_nodes", type=int, default=1)
     args.add_argument("--shift", type=float, default=3.0)
     args.add_argument("--learning_rate", type=float, default=1e-4)
-    args.add_argument("--num_workers", type=int, default=8)
+    args.add_argument("--num_workers", type=int, default=0)
     args.add_argument("--epochs", type=int, default=-1)
     args.add_argument("--max_steps", type=int, default=2000000)
     args.add_argument("--every_n_train_steps", type=int, default=2000)
