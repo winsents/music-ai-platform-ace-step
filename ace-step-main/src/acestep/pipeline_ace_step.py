@@ -10,8 +10,12 @@ import random
 import time
 import os
 import re
+from datetime import datetime
 
 import torch
+from torch import amp
+import soundfile as sf
+
 from loguru import logger
 from tqdm import tqdm
 import json
@@ -186,42 +190,49 @@ class ACEStepPipeline:
         ace_step_checkpoint_path = os.path.join(checkpoint_dir, "ace_step_transformer")
         text_encoder_checkpoint_path = os.path.join(checkpoint_dir, "umt5-base")
 
+        # Transformer
         self.ace_step_transformer = ACEStepTransformer2DModel.from_pretrained(
             ace_step_checkpoint_path, torch_dtype=self.dtype
         )
-        # self.ace_step_transformer.to(self.device).eval().to(self.dtype)
         if self.cpu_offload:
-            self.ace_step_transformer = (
-                self.ace_step_transformer.to("cpu").eval().to(self.dtype)
-            )
+            self.ace_step_transformer = self.ace_step_transformer.to("cpu").eval().to(self.dtype)
         else:
-            self.ace_step_transformer = (
-                self.ace_step_transformer.to(self.device).eval().to(self.dtype)
-            )
+            self.ace_step_transformer = self.ace_step_transformer.to(self.device).eval().to(self.dtype)
         if self.torch_compile:
             self.ace_step_transformer = torch.compile(self.ace_step_transformer)
 
+        # DCAE
         self.music_dcae = MusicDCAE(
             dcae_checkpoint_path=dcae_checkpoint_path,
             vocoder_checkpoint_path=vocoder_checkpoint_path,
         )
-        # self.music_dcae.to(self.device).eval().to(self.dtype)
-        if self.cpu_offload:  # might be redundant
-            self.music_dcae = self.music_dcae.to("cpu").eval().to(self.dtype)
+        dev = "cpu" if self.cpu_offload else self.device
+        self.music_dcae = self.music_dcae.to(dev).eval()
+
+        force_fp32 = os.getenv("ACE_DCAE_FORCE_FP32", "1") == "1"
+        if force_fp32:
+            # 统一成 FP32（输入也会在 latents2audio 中转为 FP32）
+            self.music_dcae = self.music_dcae.to(torch.float32)
+            try:
+                self.music_dcae.dcae = self.music_dcae.dcae.to(torch.float32)
+            except AttributeError:
+                pass
         else:
-            self.music_dcae = self.music_dcae.to(self.device).eval().to(self.dtype)
+            # 按管线精度（通常是 bfloat16）
+            self.music_dcae = self.music_dcae.to(self.dtype)
+            try:
+                self.music_dcae.dcae = self.music_dcae.dcae.to(self.dtype)
+            except AttributeError:
+                pass
+
+        logger.info(f"DCAE conv_in dtype: {self.music_dcae.dcae.decoder.conv_in.weight.dtype}")
         if self.torch_compile:
             self.music_dcae = torch.compile(self.music_dcae)
 
-        lang_segment = LangSegment()
-        lang_segment.setfilters(language_filters.default)
-        self.lang_segment = lang_segment
-        self.lyric_tokenizer = VoiceBpeTokenizer()
-
+        # Text Encoder
         text_encoder_model = UMT5EncoderModel.from_pretrained(
             text_encoder_checkpoint_path, torch_dtype=self.dtype
         ).eval()
-        # text_encoder_model = text_encoder_model.to(self.device).to(self.dtype)
         if self.cpu_offload:
             text_encoder_model = text_encoder_model.to("cpu").eval().to(self.dtype)
         else:
@@ -231,51 +242,30 @@ class ACEStepPipeline:
         if self.torch_compile:
             self.text_encoder_model = torch.compile(self.text_encoder_model)
 
-        self.text_tokenizer = AutoTokenizer.from_pretrained(
-            text_encoder_checkpoint_path
-        )
+        # Tokenizer / utils
+        self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_checkpoint_path)
+        lang_segment = LangSegment()
+        lang_segment.setfilters(language_filters.default)
+        self.lang_segment = lang_segment
+        self.lyric_tokenizer = VoiceBpeTokenizer()
+
         self.loaded = True
 
-        # compile
-        if self.torch_compile:
-            if export_quantized_weights:
-                from torch.ao.quantization import (
-                    quantize_,
-                    Int4WeightOnlyConfig,
-                )
-
-                group_size = 128
-                use_hqq = True
-                quantize_(
-                    self.ace_step_transformer,
-                    Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq),
-                )
-                quantize_(
-                    self.text_encoder_model,
-                    Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq),
-                )
-
-                # save quantized weights
-                torch.save(
-                    self.ace_step_transformer.state_dict(),
-                    os.path.join(
-                        ace_step_checkpoint_path, "diffusion_pytorch_model_int4wo.bin"
-                    ),
-                )
-                print(
-                    "Quantized Weights Saved to: ",
-                    os.path.join(
-                        ace_step_checkpoint_path, "diffusion_pytorch_model_int4wo.bin"
-                    ),
-                )
-                torch.save(
-                    self.text_encoder_model.state_dict(),
-                    os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"),
-                )
-                print(
-                    "Quantized Weights Saved to: ",
-                    os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"),
-                )
+        # 可选：导出量化权重
+        if self.torch_compile and export_quantized_weights:
+            from torch.ao.quantization import quantize_, Int4WeightOnlyConfig
+            group_size = 128
+            use_hqq = True
+            quantize_(self.ace_step_transformer, Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq))
+            quantize_(self.text_encoder_model, Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq))
+            torch.save(
+                self.ace_step_transformer.state_dict(),
+                os.path.join(ace_step_checkpoint_path, "diffusion_pytorch_model_int4wo.bin"),
+            )
+            torch.save(
+                self.text_encoder_model.state_dict(),
+                os.path.join(text_encoder_checkpoint_path, "pytorch_model_int4wo.bin"),
+            )
 
     def load_quantized_checkpoint(self, checkpoint_dir=None):
         checkpoint_dir = self.get_checkpoint_path(checkpoint_dir, REPO_ID_QUANT)
@@ -1357,50 +1347,82 @@ class ACEStepPipeline:
         output_audio_paths = []
         bs = latents.shape[0]
         pred_latents = latents
+
         with torch.no_grad():
-            if self.overlapped_decode and target_wav_duration_second > 48:
-                _, pred_wavs = self.music_dcae.decode_overlap(pred_latents, sr=sample_rate)
+            # 环境变量：ACE_DCAE_FORCE_FP32=1 时强制用 FP32 解码（默认开启）
+            force_fp32 = os.getenv("ACE_DCAE_FORCE_FP32", "1") == "1"
+
+            if force_fp32:
+                try:
+                    self.music_dcae.dcae = self.music_dcae.dcae.to(torch.float32)
+                except AttributeError:
+                    pass
+                self.music_dcae = self.music_dcae.to(torch.float32)
+                pred_latents = pred_latents.to(torch.float32)
+
+                # 对齐到 DCAE 当前设备
+                dev = self.music_dcae.dcae.decoder.conv_in.weight.device
+                pred_latents = pred_latents.to(dev)
+
+                with amp.autocast("cuda", enabled=False):
+                    if self.overlapped_decode and target_wav_duration_second > 48:
+                        _, pred_wavs = self.music_dcae.decode_overlap(pred_latents, sr=sample_rate)
+                    else:
+                        _, pred_wavs = self.music_dcae.decode(pred_latents, sr=sample_rate)
             else:
-                _, pred_wavs = self.music_dcae.decode(pred_latents, sr=sample_rate)
-        pred_wavs = [pred_wav.cpu().float() for pred_wav in pred_wavs]
+                target_dtype = self.music_dcae.dcae.decoder.conv_in.weight.dtype
+                dev = self.music_dcae.dcae.decoder.conv_in.weight.device
+                pred_latents = pred_latents.to(device=dev, dtype=target_dtype)
+
+                if self.overlapped_decode and target_wav_duration_second > 48:
+                    _, pred_wavs = self.music_dcae.decode_overlap(pred_latents, sr=sample_rate)
+                else:
+                    _, pred_wavs = self.music_dcae.decode(pred_latents, sr=sample_rate)
+
+        pred_wavs = [w.cpu().float() for w in pred_wavs]
         for i in tqdm(range(bs)):
-            output_audio_path = self.save_wav_file(
+            path = self.save_wav_file(
                 pred_wavs[i],
                 i,
                 save_path=save_path,
                 sample_rate=sample_rate,
                 format=format,
             )
-            output_audio_paths.append(output_audio_path)
+            output_audio_paths.append(path)
         return output_audio_paths
 
-    def save_wav_file(
-        self, target_wav, idx, save_path=None, sample_rate=48000, format="wav"
-    ):
+    def save_wav_file(self, pred_wav, i, save_path=None, sample_rate=48000, format="wav"):
         if save_path is None:
             logger.warning("save_path is None, using default path ./outputs/")
-            base_path = "./outputs"
-            ensure_directory_exists(base_path)
-            output_path_wav = (
-                f"{base_path}/output_{time.strftime('%Y%m%d%H%M%S')}_{idx}."+format
-            )
-        else:
-            ensure_directory_exists(os.path.dirname(save_path))
-            if os.path.isdir(save_path):
-                logger.info(f"Provided save_path '{save_path}' is a directory. Appending timestamped filename.")
-                output_path_wav = os.path.join(save_path, f"output_{time.strftime('%Y%m%d%H%M%S')}_{idx}."+format)
-            else:
-                output_path_wav = save_path
+        out_dir = save_path or "./outputs/"
+        os.makedirs(out_dir, exist_ok=True)
 
-        target_wav = target_wav.float()
-        backend = "soundfile"
-        if format == "ogg":
-            backend = "sox"
-        logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
-        torchaudio.save(
-            output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
-        )
-        return output_path_wav
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        output_audio_path = os.path.join(out_dir, f"output_{ts}_{i}.{format}")
+
+        # 仅支持 WAV 用 soundfile，避免 torchaudio/torchcodec
+        if format.lower() != "wav":
+            raise RuntimeError(f"当前仅支持保存为 WAV，收到格式: {format}")
+
+        # 准备数据：[T] 或 [T, C]，值域[-1,1]
+        wav = pred_wav.detach().cpu().float()
+        wav = torch.clamp(wav, -1.0, 1.0)
+
+        # 统一 shape：soundfile 接受 [T] 或 [T, C]
+        if wav.ndim == 1:
+            wav_np = wav.numpy()
+        elif wav.ndim == 2:
+            # 常见 [C, T] 转为 [T, C]
+            if wav.shape[0] <= 8 and wav.shape[0] < wav.shape[1]:
+                wav_np = wav.transpose(0, 1).numpy()
+            else:
+                wav_np = wav.numpy()
+        else:
+            wav_np = wav.squeeze().numpy()
+
+        logger.info(f"Saving audio to {output_audio_path} using backend soundfile")
+        sf.write(output_audio_path, wav_np, samplerate=sample_rate, subtype="PCM_16")
+        return output_audio_path
 
     @cpu_offload("music_dcae")
     def infer_latents(self, input_audio_path):
@@ -1408,7 +1430,18 @@ class ACEStepPipeline:
             return None
         input_audio, sr = self.music_dcae.load_audio(input_audio_path)
         input_audio = input_audio.unsqueeze(0)
-        input_audio = input_audio.to(device=self.device, dtype=self.dtype)
+
+        force_fp32 = os.getenv("ACE_DCAE_FORCE_FP32", "1") == "1"
+        if force_fp32:
+            # 与 DCAE 权重一致，强制 FP32
+            input_audio = input_audio.to(device=self.device, dtype=torch.float32)
+            try:
+                self.music_dcae.dcae = self.music_dcae.dcae.to(torch.float32)
+            except AttributeError:
+                pass
+        else:
+            input_audio = input_audio.to(device=self.device, dtype=self.dtype)
+
         latents, _ = self.music_dcae.encode(input_audio, sr=sr)
         return latents
 

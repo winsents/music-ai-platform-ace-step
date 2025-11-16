@@ -1,3 +1,6 @@
+import soundfile as sf
+import torch.distributed as dist
+
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning import Trainer
@@ -8,6 +11,10 @@ import json
 import matplotlib
 import torch.nn.functional as F
 import torch.utils.data
+
+import math
+from torch import amp
+
 from pytorch_lightning.core import LightningModule
 from torch.utils.data import DataLoader
 from acestep.schedulers.scheduling_flow_match_euler_discrete import (
@@ -26,7 +33,7 @@ from tqdm import tqdm
 import random
 import os
 from acestep.pipeline_ace_step import ACEStepPipeline
-
+from pytorch_lightning.strategies import DDPStrategy
 
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
@@ -100,6 +107,27 @@ class Pipeline(LightningModule):
                 self.mert_model = AutoModel.from_pretrained(
                     "m-a-p/MERT-v1-330M", trust_remote_code=True, cache_dir=checkpoint_dir
                 ).eval()
+                self.mert_model.requires_grad_(False)
+                self.resampler_mert = torchaudio.transforms.Resample(
+                    orig_freq=48000, new_freq=24000
+                )
+                self.resampler_mert.to("cpu")
+                self.mert_model.to("cpu")
+                self.processor_mert = Wav2Vec2FeatureExtractor.from_pretrained(
+                    "m-a-p/MERT-v1-330M", trust_remote_code=True
+                )
+
+                self.hubert_model = AutoModel.from_pretrained("utter-project/mHuBERT-147").eval()
+                self.hubert_model.requires_grad_(False)
+                self.resampler_mhubert = torchaudio.transforms.Resample(
+                    orig_freq=48000, new_freq=16000
+                )
+                self.resampler_mhubert.to("cpu")
+                self.hubert_model.to("cpu")
+                self.processor_mhubert = Wav2Vec2FeatureExtractor.from_pretrained(
+                    "utter-project/mHuBERT-147",
+                    cache_dir=checkpoint_dir,
+                )
             except:
                 import json
                 import os
@@ -113,187 +141,148 @@ class Pipeline(LightningModule):
                     "blobs",
                     "14f770758c7fe5c5e8ead4fe0f8e5fa727eb6942"
                 )
-
                 with open(mert_config_path) as f:
                     mert_config = json.load(f)
                 mert_config["conv_pos_batch_norm"] = False
                 with open(mert_config_path, mode="w") as f:
                     json.dump(mert_config, f)
+
                 self.mert_model = AutoModel.from_pretrained(
                     "m-a-p/MERT-v1-330M", trust_remote_code=True, cache_dir=checkpoint_dir
                 ).eval()
-            self.mert_model.requires_grad_(False)
-            self.resampler_mert = torchaudio.transforms.Resample(
-                orig_freq=48000, new_freq=24000
-            )
-            self.processor_mert = Wav2Vec2FeatureExtractor.from_pretrained(
-                "m-a-p/MERT-v1-330M", trust_remote_code=True
-            )
+                self.mert_model.requires_grad_(False)
+                self.resampler_mert = torchaudio.transforms.Resample(
+                    orig_freq=48000, new_freq=24000
+                )
+                self.resampler_mert.to("cpu")
+                self.mert_model.to("cpu")
+                self.processor_mert = Wav2Vec2FeatureExtractor.from_pretrained(
+                    "m-a-p/MERT-v1-330M", trust_remote_code=True
+                )
 
-            self.hubert_model = AutoModel.from_pretrained("utter-project/mHuBERT-147").eval()
-            self.hubert_model.requires_grad_(False)
-            self.resampler_mhubert = torchaudio.transforms.Resample(
-                orig_freq=48000, new_freq=16000
-            )
-            self.processor_mhubert = Wav2Vec2FeatureExtractor.from_pretrained(
-                "utter-project/mHuBERT-147",
-                cache_dir=checkpoint_dir,
-            )
+                self.hubert_model = AutoModel.from_pretrained("utter-project/mHuBERT-147").eval()
+                self.hubert_model.requires_grad_(False)
+                self.resampler_mhubert = torchaudio.transforms.Resample(
+                    orig_freq=48000, new_freq=16000
+                )
+                self.resampler_mhubert.to("cpu")
+                self.hubert_model.to("cpu")
+                self.processor_mhubert = Wav2Vec2FeatureExtractor.from_pretrained(
+                    "utter-project/mHuBERT-147",
+                    cache_dir=checkpoint_dir,
+                )
 
             self.ssl_coeff = ssl_coeff
 
+    def _is_global_zero(self):
+        try:
+            if not dist.is_available() or not dist.is_initialized():
+                return True
+            return dist.get_rank() == 0
+        except Exception:
+            return True
+
+    def on_fit_start(self):
+        # 强制将 SSL 子模块固定在 CPU
+        if hasattr(self, "mert_model") and self.mert_model is not None:
+            self.mert_model.eval().requires_grad_(False).to("cpu")
+        if hasattr(self, "hubert_model") and self.hubert_model is not None:
+            self.hubert_model.eval().requires_grad_(False).to("cpu")
+        if hasattr(self, "resampler_mert") and self.resampler_mert is not None:
+            self.resampler_mert.to("cpu")
+        if hasattr(self, "resampler_mhubert") and self.resampler_mhubert is not None:
+            self.resampler_mhubert.to("cpu")
+
     def infer_mert_ssl(self, target_wavs, wav_lengths):
-        # Input is N x 2 x T (48kHz), convert to N x T (24kHz), mono
-        mert_input_wavs_mono_24k = self.resampler_mert(target_wavs.mean(dim=1))
+        # Input: [B, 2, T@48k] -> mono@48k -> resample@24k (CPU)
+        x_48k_mono = target_wavs.mean(dim=1).cpu()              # [B, T]
+        mert_input_wavs_mono_24k = self.resampler_mert(x_48k_mono)
         bsz = target_wavs.shape[0]
-        actual_lengths_24k = wav_lengths // 2  # 48kHz -> 24kHz
+        actual_lengths_24k = (wav_lengths // 2).cpu()           # 48k -> 24k
 
-        # Normalize the actual audio part
-        means = torch.stack(
-            [
-                mert_input_wavs_mono_24k[i, : actual_lengths_24k[i]].mean()
-                for i in range(bsz)
-            ]
-        )
-        vars = torch.stack(
-            [
-                mert_input_wavs_mono_24k[i, : actual_lengths_24k[i]].var()
-                for i in range(bsz)
-            ]
-        )
-        mert_input_wavs_mono_24k = (
-            mert_input_wavs_mono_24k - means.view(-1, 1)
-        ) / torch.sqrt(vars.view(-1, 1) + 1e-7)
+        # Normalize only valid audio part
+        means = torch.stack([mert_input_wavs_mono_24k[i, : actual_lengths_24k[i]].mean() for i in range(bsz)])
+        vars  = torch.stack([mert_input_wavs_mono_24k[i, : actual_lengths_24k[i]].var()  for i in range(bsz)])
+        mert_input_wavs_mono_24k = (mert_input_wavs_mono_24k - means.view(-1, 1)) / torch.sqrt(vars.view(-1, 1) + 1e-7)
 
-        # MERT SSL constraint
-        # Define the length of each chunk (5 seconds of samples)
-        chunk_size = 24000 * 5  # 5 seconds, 24000 samples per second
-        total_length = mert_input_wavs_mono_24k.shape[1]
-
+        # chunking @24k
+        chunk_size = 24000 * 5
         num_chunks_per_audio = (actual_lengths_24k + chunk_size - 1) // chunk_size
-
-        # Process chunks
-        all_chunks = []
-        chunk_actual_lengths = []
+        all_chunks, chunk_actual_lengths = [], []
         for i in range(bsz):
             audio = mert_input_wavs_mono_24k[i]
-            actual_length = actual_lengths_24k[i]
+            actual_length = int(actual_lengths_24k[i].item())
             for start in range(0, actual_length, chunk_size):
                 end = min(start + chunk_size, actual_length)
                 chunk = audio[start:end]
-                if len(chunk) < chunk_size:
-                    chunk = F.pad(
-                        chunk, (0, chunk_size - len(chunk))
-                    )  # Pad insufficient parts with zeros
+                if chunk.numel() < chunk_size:
+                    chunk = F.pad(chunk, (0, chunk_size - chunk.numel()))
                 all_chunks.append(chunk)
                 chunk_actual_lengths.append(end - start)
 
-        # Stack all chunks to (total_chunks, chunk_size)
-        all_chunks = torch.stack(all_chunks, dim=0)
+        if len(all_chunks) == 0:
+            return [torch.empty(0, 1)] * bsz
 
-        # Batch inference
+        all_chunks = torch.stack(all_chunks, dim=0)             # CPU tensor
+
         with torch.no_grad():
-            # Output shape: (total_chunks, seq_len, hidden_size)
-            mert_ssl_hidden_states = self.mert_model(all_chunks).last_hidden_state
+            mert_ssl_hidden_states = self.mert_model(all_chunks).last_hidden_state  # [Nchunk, S, C]
 
-        # Calculate the number of features for each chunk
-        chunk_num_features = [(length + 319) // 320 for length in chunk_actual_lengths]
+        chunk_num_features = [(l + 319) // 320 for l in chunk_actual_lengths]
+        chunk_hidden_states = [mert_ssl_hidden_states[i, : chunk_num_features[i], :] for i in range(len(all_chunks))]
 
-        # Trim the hidden states of each chunk
-        chunk_hidden_states = [
-            mert_ssl_hidden_states[i, : chunk_num_features[i], :]
-            for i in range(len(all_chunks))
-        ]
-
-        # Organize hidden states by audio
-        mert_ssl_hidden_states_list = []
-        chunk_idx = 0
+        mert_ssl_hidden_states_list, chunk_idx = [], 0
         for i in range(bsz):
-            audio_chunks = chunk_hidden_states[
-                chunk_idx : chunk_idx + num_chunks_per_audio[i]
-            ]
-            audio_hidden = torch.cat(
-                audio_chunks, dim=0
-            )  # Concatenate chunks of the same audio
+            k = int(num_chunks_per_audio[i].item())
+            audio_chunks = chunk_hidden_states[chunk_idx : chunk_idx + k]
+            audio_hidden = torch.cat(audio_chunks, dim=0) if k > 0 else torch.empty(0, mert_ssl_hidden_states.size(-1))
             mert_ssl_hidden_states_list.append(audio_hidden)
-            chunk_idx += num_chunks_per_audio[i]
-
+            chunk_idx += k
         return mert_ssl_hidden_states_list
 
     def infer_mhubert_ssl(self, target_wavs, wav_lengths):
-        # Step 1: Preprocess audio
-        # Input: N x 2 x T (48kHz, stereo) -> N x T (16kHz, mono)
-        mhubert_input_wavs_mono_16k = self.resampler_mhubert(target_wavs.mean(dim=1))
+        # Input: [B, 2, T@48k] -> mono@48k -> resample@16k (CPU)
+        x_48k_mono = target_wavs.mean(dim=1).cpu()
+        mhubert_input_wavs_mono_16k = self.resampler_mhubert(x_48k_mono)
         bsz = target_wavs.shape[0]
-        actual_lengths_16k = wav_lengths // 3  # Convert lengths from 48kHz to 16kHz
+        actual_lengths_16k = (wav_lengths // 3).cpu()           # 48k -> 16k 近似
 
-        # Step 2: Zero-mean unit-variance normalization (only on actual audio)
-        means = torch.stack(
-            [
-                mhubert_input_wavs_mono_16k[i, : actual_lengths_16k[i]].mean()
-                for i in range(bsz)
-            ]
-        )
-        vars = torch.stack(
-            [
-                mhubert_input_wavs_mono_16k[i, : actual_lengths_16k[i]].var()
-                for i in range(bsz)
-            ]
-        )
-        mhubert_input_wavs_mono_16k = (
-            mhubert_input_wavs_mono_16k - means.view(-1, 1)
-        ) / torch.sqrt(vars.view(-1, 1) + 1e-7)
+        means = torch.stack([mhubert_input_wavs_mono_16k[i, : actual_lengths_16k[i]].mean() for i in range(bsz)])
+        vars  = torch.stack([mhubert_input_wavs_mono_16k[i, : actual_lengths_16k[i]].var()  for i in range(bsz)])
+        mhubert_input_wavs_mono_16k = (mhubert_input_wavs_mono_16k - means.view(-1, 1)) / torch.sqrt(vars.view(-1, 1) + 1e-7)
 
-        # Step 3: Define chunk size for MHubert (30 seconds at 16kHz)
-        chunk_size = 16000 * 30  # 30 seconds = 480,000 samples
-
-        # Step 4: Split audio into chunks
-        num_chunks_per_audio = (
-            actual_lengths_16k + chunk_size - 1
-        ) // chunk_size  # Ceiling division
-        all_chunks = []
-        chunk_actual_lengths = []
-
+        chunk_size = 16000 * 30
+        num_chunks_per_audio = (actual_lengths_16k + chunk_size - 1) // chunk_size
+        all_chunks, chunk_actual_lengths = [], []
         for i in range(bsz):
             audio = mhubert_input_wavs_mono_16k[i]
-            actual_length = actual_lengths_16k[i]
+            actual_length = int(actual_lengths_16k[i].item())
             for start in range(0, actual_length, chunk_size):
                 end = min(start + chunk_size, actual_length)
                 chunk = audio[start:end]
-                if len(chunk) < chunk_size:
-                    chunk = F.pad(chunk, (0, chunk_size - len(chunk)))  # Pad with zeros
+                if chunk.numel() < chunk_size:
+                    chunk = F.pad(chunk, (0, chunk_size - chunk.numel()))
                 all_chunks.append(chunk)
                 chunk_actual_lengths.append(end - start)
 
-        # Step 5: Stack all chunks for batch inference
-        all_chunks = torch.stack(all_chunks, dim=0)  # Shape: (total_chunks, chunk_size)
+        if len(all_chunks) == 0:
+            return [torch.empty(0, 1)] * bsz
 
-        # Step 6: Batch inference with MHubert model
+        all_chunks = torch.stack(all_chunks, dim=0)             # CPU tensor
+
         with torch.no_grad():
             mhubert_ssl_hidden_states = self.hubert_model(all_chunks).last_hidden_state
-            # Shape: (total_chunks, seq_len, hidden_size)
 
-        # Step 7: Compute number of features per chunk (assuming model stride of 320)
-        chunk_num_features = [(length + 319) // 320 for length in chunk_actual_lengths]
+        chunk_num_features = [(l + 319) // 320 for l in chunk_actual_lengths]
+        chunk_hidden_states = [mhubert_ssl_hidden_states[i, : chunk_num_features[i], :] for i in range(len(all_chunks))]
 
-        # Step 8: Trim hidden states to remove padding effects
-        chunk_hidden_states = [
-            mhubert_ssl_hidden_states[i, : chunk_num_features[i], :]
-            for i in range(len(all_chunks))
-        ]
-
-        # Step 9: Reorganize hidden states by original audio
-        mhubert_ssl_hidden_states_list = []
-        chunk_idx = 0
+        mhubert_ssl_hidden_states_list, chunk_idx = [], 0
         for i in range(bsz):
-            audio_chunks = chunk_hidden_states[
-                chunk_idx : chunk_idx + num_chunks_per_audio[i]
-            ]
-            audio_hidden = torch.cat(
-                audio_chunks, dim=0
-            )  # Concatenate chunks for this audio
+            k = int(num_chunks_per_audio[i].item())
+            audio_chunks = chunk_hidden_states[chunk_idx : chunk_idx + k]
+            audio_hidden = torch.cat(audio_chunks, dim=0) if k > 0 else torch.empty(0, mhubert_ssl_hidden_states.size(-1))
             mhubert_ssl_hidden_states_list.append(audio_hidden)
-            chunk_idx += num_chunks_per_audio[i]
+            chunk_idx += k
         return mhubert_ssl_hidden_states_list
 
     def get_text_embeddings(self, texts, device, text_max_length=256):
@@ -317,45 +306,54 @@ class Pipeline(LightningModule):
         target_wavs = batch["target_wavs"]
         wav_lengths = batch["wav_lengths"]
 
-        dtype = target_wavs.dtype
         bs = target_wavs.shape[0]
         device = target_wavs.device
+        dtype = target_wavs.dtype
 
-        # SSL constraints
+        # SSL 约束放在 CPU 计算，之后搬回训练设备/精度
         mert_ssl_hidden_states = None
         mhubert_ssl_hidden_states = None
         if train:
-            with torch.amp.autocast(device_type="cuda", dtype=dtype):
+            with torch.no_grad():
+                # mert_ssl_hidden_states = self.infer_mert_ssl(target_wavs.cpu(), wav_lengths.cpu())
                 mert_ssl_hidden_states = self.infer_mert_ssl(target_wavs, wav_lengths)
-                mhubert_ssl_hidden_states = self.infer_mhubert_ssl(
-                    target_wavs, wav_lengths
-                )
+                # mhubert_ssl_hidden_states = self.infer_mhubert_ssl(target_wavs.cpu(), wav_lengths.cpu())
+            if mert_ssl_hidden_states is not None:
+                mert_ssl_hidden_states = [t.to(device=device, dtype=dtype) for t in mert_ssl_hidden_states]
+            if mhubert_ssl_hidden_states is not None:
+                mhubert_ssl_hidden_states = [t.to(device=device, dtype=dtype) for t in mhubert_ssl_hidden_states]
 
-        # 1: text embedding
+        # 文本编码
         texts = batch["prompts"]
-        encoder_text_hidden_states, text_attention_mask = self.get_text_embeddings(
-            texts, device
-        )
+        encoder_text_hidden_states, text_attention_mask = self.get_text_embeddings(texts, device)
         encoder_text_hidden_states = encoder_text_hidden_states.to(dtype)
 
-        target_latents, _ = self.dcae.encode(target_wavs, wav_lengths)
-        attention_mask = torch.ones(
-            bs, target_latents.shape[-1], device=device, dtype=dtype
-        )
+        # DCAE 编码统一 FP32，禁用混精；设备对齐到音频所在设备
+        dcae_dev = device
+        self.dcae = self.dcae.to(device=dcae_dev, dtype=torch.float32)
+        target_wavs_32 = target_wavs.to(device=dcae_dev, dtype=torch.float32)
+        with amp.autocast("cuda", enabled=False):
+            target_latents, _ = self.dcae.encode(target_wavs_32, wav_lengths)
 
-        speaker_embds = batch["speaker_embs"].to(dtype)
+        # 掩码与其余字段
+        attention_mask = torch.ones(bs, target_latents.shape[-1],
+                                    device=target_latents.device,
+                                    dtype=target_latents.dtype)
+
+        speaker_embds = batch["speaker_embs"].to(dtype).to(device)
         keys = batch["keys"]
-        lyric_token_ids = batch["lyric_token_ids"]
-        lyric_mask = batch["lyric_masks"]
+        # lyric_token_ids = batch["lyric_token_ids"]
+        # lyric_mask = batch["lyric_masks"]
+        lyric_token_ids = batch["lyric_token_ids"].to(device)
+        lyric_mask = batch["lyric_masks"].to(device)
 
-        # cfg
         if train:
+            # cfg 掩码逻辑保持不变
             full_cfg_condition_mask = torch.where(
                 (torch.rand(size=(bs,), device=device) < 0.15),
                 torch.zeros(size=(bs,), device=device),
                 torch.ones(size=(bs,), device=device),
             ).long()
-            # N x T x 768
             encoder_text_hidden_states = torch.where(
                 full_cfg_condition_mask.unsqueeze(1).unsqueeze(1).bool(),
                 encoder_text_hidden_states,
@@ -367,14 +365,12 @@ class Pipeline(LightningModule):
                 torch.zeros(size=(bs,), device=device),
                 torch.ones(size=(bs,), device=device),
             ).long()
-            # N x 512
             speaker_embds = torch.where(
                 full_cfg_condition_mask.unsqueeze(1).bool(),
                 speaker_embds,
                 torch.zeros_like(speaker_embds),
             )
 
-            # Lyrics
             full_cfg_condition_mask = torch.where(
                 (torch.rand(size=(bs,), device=device) < 0.15),
                 torch.zeros(size=(bs,), device=device),
@@ -738,7 +734,8 @@ class Pipeline(LightningModule):
             seed = random.randint(0, 2**32 - 1)
             random_generators[i].manual_seed(seed)
             seeds.append(seed)
-        duration = 240  # Fixed duration (24 * 10)
+        duration = 240  # 24 * 10
+
         pred_latents = self.diffusion_process(
             duration=duration,
             encoder_text_hidden_states=encoder_text_hidden_states,
@@ -752,10 +749,13 @@ class Pipeline(LightningModule):
             omega_scale=omega_scale,
         )
 
-        audio_lengths = batch["wav_lengths"]
-        sr, pred_wavs = self.dcae.decode(
-            pred_latents, audio_lengths=audio_lengths, sr=48000
-        )
+        # DCAE 解码统一 FP32，禁用混精；设备对齐到潜变量所在设备
+        dev = pred_latents.device
+        self.dcae = self.dcae.to(device=dev, dtype=torch.float32)
+        pred_latents_32 = pred_latents.to(dtype=torch.float32)
+        with amp.autocast("cuda", enabled=False):
+            sr, pred_wavs = self.dcae.decode(pred_latents_32, audio_lengths=batch["wav_lengths"], sr=48000)
+
         return {
             "target_wavs": batch["target_wavs"],
             "pred_wavs": pred_wavs,
@@ -776,12 +776,19 @@ class Pipeline(LightningModule):
 
     def plot_step(self, batch, batch_idx):
         global_step = self.global_step
-        if (
-            global_step % self.hparams.every_plot_step != 0
-            or self.local_rank != 0
-            or torch.distributed.get_rank() != 0
-            or torch.cuda.current_device() != 0
-        ):
+        # if (
+        #     global_step % self.hparams.every_plot_step != 0
+        #     or self.local_rank != 0
+        #     or torch.distributed.get_rank() != 0
+        #     or torch.cuda.current_device() != 0
+        # ):
+        #     return
+        # 仅在全局0号进程/设备0上，且到达间隔步时才执行
+        if global_step % self.hparams.every_plot_step != 0:
+            return
+        if not self._is_global_zero():
+            return
+        if torch.cuda.is_available() and torch.cuda.current_device() != 0:
             return
         results = self.predict_step(batch)
 
@@ -792,6 +799,7 @@ class Pipeline(LightningModule):
         candidate_lyric_chunks = results["candidate_lyric_chunks"]
         sr = results["sr"]
         seeds = results["seeds"]
+
         i = 0
         for key, target_wav, pred_wav, prompt, candidate_lyric_chunk, seed in zip(
             keys, target_wavs, pred_wavs, prompts, candidate_lyric_chunks, seeds
@@ -804,15 +812,21 @@ class Pipeline(LightningModule):
             save_dir = f"{log_dir}/eval_results/step_{self.global_step}"
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir, exist_ok=True)
-            torchaudio.save(
-                f"{save_dir}/target_wav_{key}_{i}.wav", target_wav.float().cpu(), sr
-            )
-            torchaudio.save(
-                f"{save_dir}/pred_wav_{key}_{i}.wav", pred_wav.float().cpu(), sr
-            )
-            with open(
-                f"{save_dir}/key_prompt_lyric_{key}_{i}.txt", "w", encoding="utf-8"
-            ) as f:
+
+            # 用 soundfile 保存 WAV，避免 torchcodec 依赖
+            def _to_sf(wav_tensor):
+                wav = torch.clamp(wav_tensor.float().cpu(), -1.0, 1.0)
+                if wav.ndim == 1:
+                    return wav.numpy()
+                if wav.ndim == 2:
+                    # [C, T] -> [T, C]
+                    return wav.transpose(0, 1).numpy()
+                return wav.squeeze().numpy()
+
+            sf.write(f"{save_dir}/target_wav_{key}_{i}.wav", _to_sf(target_wav), sr, subtype="PCM_16")
+            sf.write(f"{save_dir}/pred_wav_{key}_{i}.wav", _to_sf(pred_wav), sr, subtype="PCM_16")
+
+            with open(f"{save_dir}/key_prompt_lyric_{key}_{i}.txt", "w", encoding="utf-8") as f:
                 f.write(key_prompt_lyric)
             i += 1
 
@@ -845,7 +859,8 @@ def main(args):
         num_nodes=args.num_nodes,
         precision=args.precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        strategy="ddp_find_unused_parameters_true",
+        # strategy="ddp_find_unused_parameters_true",
+        strategy=DDPStrategy(find_unused_parameters=True, broadcast_buffers=False),
         max_epochs=args.epochs,
         max_steps=args.max_steps,
         log_every_n_steps=1,
